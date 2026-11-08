@@ -1,0 +1,40 @@
+services:
+  # Optional Ollama service for fully local extraction. Start with:
+  # docker compose -f compose.yaml -f compose.local-llm.yaml up -d
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    # Do not publish the Ollama port to the host unless you need it.
+
+  model-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      AWM_OLLAMA_MODEL: ${AWM_OLLAMA_MODEL:-qwen2.5:14b}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull \"$$AWM_OLLAMA_MODEL\""]
+    restart: "no"
+
+  awm:
+    environment:
+      AWM_LLM_BASE_URL: http://ollama:11434/v1
+      AWM_LLM_MODEL: ${AWM_OLLAMA_MODEL:-qwen2.5:14b}
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+
+  worker:
+    environment:
+      AWM_LLM_BASE_URL: http://ollama:11434/v1
+      AWM_LLM_MODEL: ${AWM_OLLAMA_MODEL:-qwen2.5:14b}
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+
+volumes:
+  ollama-data:
+    name: ${OLLAMA_VOLUME_NAME:-agent-work-memory-ollama}

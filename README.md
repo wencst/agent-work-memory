@@ -18,7 +18,27 @@ Conversation transcripts are not reliable memories. “We should upgrade Postgre
 - Extracted claims are not searchable by agents until approved.
 - MIT licensed.
 
-## Quick start
+## Quick start: Docker Compose
+
+Requires Docker Engine with Compose v2 and Python 3 for generating a secret.
+
+```bash
+git clone https://github.com/wencst/agent-work-memory.git
+cd agent-work-memory
+./scripts/compose-up.sh
+```
+
+The helper creates `.env` with a random API key, then builds and starts the API and background worker. API: `http://127.0.0.1:8765`. Agent data and SQLite storage persist in the named volume `agent-work-memory-data`. See [`docs/deployment.md`](docs/deployment.md) for backup/restore, retention, model setup, and alternate deployment modes.
+
+To add a bundled, local Ollama model (first run downloads model weights):
+
+```bash
+./scripts/compose-local-llm.sh
+```
+
+The optional Ollama model files persist in a separate named volume. For air-gapped environments, preload and mirror all required images and weights. No installation mode can be assumed offline until network egress is blocked and tested.
+
+## Quick start: Python
 
 Requires Python 3.11+.
 
@@ -30,25 +50,29 @@ export AWM_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32)
 awm serve
 ```
 
-The API binds to `127.0.0.1:8765` by default. For initial setup, use the built-in OpenCode plugin described in [`integrations/opencode/README.md`](integrations/opencode/README.md). Never expose this MVP to an untrusted network.
+In another terminal with the same environment, run `awm worker` to process events and enforce retention. The default database is `~/.local/share/agent-work-memory/memory.sqlite3`.
 
-To extract candidates, configure a local OpenAI-compatible model endpoint and run the worker explicitly:
+## Connect OpenCode
 
-```bash
-export AWM_LLM_BASE_URL=http://127.0.0.1:11434/v1
-export AWM_LLM_MODEL=qwen2.5:14b
-awm process --once
-```
+See [`integrations/opencode/README.md`](integrations/opencode/README.md). The adapter is experimental; validate the actual events emitted by your OpenCode version before using it with sensitive work.
 
-The worker sends event content to the configured endpoint. Do not configure a public/cloud endpoint unless your data policy explicitly permits it. The API itself does not call any model provider.
+## Add a custom CLI or desktop agent
 
-Review candidates in the API:
+Any agent able to issue HTTP requests can use the stable v1 event contract. See [`docs/custom-agent-integration.md`](docs/custom-agent-integration.md) for cURL, Python, desktop companion, idempotency, and approved-memory retrieval examples. Codex and Claude Code native adapters are planned after OpenCode validation.
+
+## Review candidates
 
 ```bash
-curl -H "Authorization: Bearer $AWM_API_KEY" http://127.0.0.1:8765/v1/memories?status=pending
+# Use the API key from .env for Docker Compose deployments.
+curl -H "Authorization: Bearer $AWM_API_KEY" \
+  'http://127.0.0.1:8765/v1/memories?status=pending'
+
 curl -X POST -H "Authorization: Bearer $AWM_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"action":"approve"}' http://127.0.0.1:8765/v1/memories/MEMORY_ID/review
+  -d '{"action":"approve"}' \
+  http://127.0.0.1:8765/v1/memories/MEMORY_ID/review
 ```
+
+Only approved claims are returned by `/v1/search`.
 
 ## Design principles
 
@@ -59,7 +83,7 @@ curl -X POST -H "Authorization: Bearer $AWM_API_KEY" -H 'Content-Type: applicati
 5. **Keep integrations replaceable.** Agent-specific adapters implement the same HTTP contract; MCP can be added as another access surface.
 6. **Personal first.** Do not mistake one API key for multi-tenant authorization. Team/project sharing is explicitly out of scope for this MVP.
 
-See [`docs/architecture.md`](docs/architecture.md), [`docs/integration-contract.md`](docs/integration-contract.md), and [`docs/security-and-privacy.md`](docs/security-and-privacy.md).
+See [`docs/architecture.md`](docs/architecture.md), [`docs/integration-contract.md`](docs/integration-contract.md), [`docs/security-and-privacy.md`](docs/security-and-privacy.md), and [`docs/deployment.md`](docs/deployment.md).
 
 ## Development
 
@@ -74,7 +98,8 @@ pytest
 - [x] 30-day configurable raw-content retention
 - [x] Candidate memory review and approved-memory retrieval
 - [x] OpenCode experimental plugin
-- [x] Local-first, explicitly invoked extraction worker
+- [x] Versioned HTTP integration contract and custom-agent examples
+- [x] Docker Compose deployment with persistent volumes and worker-managed retention
 - [ ] Verify and improve OpenCode capture coverage against supported versions
 - [ ] Codex adapter
 - [ ] Generic SDK and Claude Code adapter

@@ -60,9 +60,10 @@ def apply_retention(settings: Settings) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="awm")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("serve", help="Run the local HTTP API")
+    sub.add_parser("serve", help="Run the HTTP API")
     process = sub.add_parser("process", help="Extract pending memory candidates using the configured model endpoint")
     process.add_argument("--once", action="store_true", help="Process at most one event and exit")
+    sub.add_parser("worker", help="Run extraction and scheduled raw-content retention")
     sub.add_parser("expire", help="Clear raw event content past the configured retention period")
     args = parser.parse_args()
     settings = Settings.from_env()
@@ -76,6 +77,9 @@ def main() -> None:
             while True:
                 if process_once(settings) == 0:
                     time.sleep(2)
+    elif args.command == "worker":
+        from .worker import run
+        run()
     elif args.command == "expire":
         print(json.dumps({"expired_raw_events": apply_retention(settings)}))
 

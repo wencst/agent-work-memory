@@ -1,0 +1,45 @@
+services:
+  awm:
+    build: .
+    image: agent-work-memory:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AWM_HOST: 0.0.0.0
+      AWM_PORT: 8765
+      AWM_DATABASE_PATH: /data/memory.sqlite3
+      AWM_RAW_RETENTION_DAYS: ${AWM_RAW_RETENTION_DAYS:-30}
+    ports:
+      # Loopback-only by default. Change the host IP only after adding TLS and
+      # suitable authentication/authorization for your deployment.
+      - "${AWM_BIND_ADDRESS:-127.0.0.1}:${AWM_PORT:-8765}:8765"
+    volumes:
+      - awm-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8765/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    image: agent-work-memory:local
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AWM_DATABASE_PATH: /data/memory.sqlite3
+      AWM_RAW_RETENTION_DAYS: ${AWM_RAW_RETENTION_DAYS:-30}
+      AWM_RETENTION_INTERVAL_SECONDS: ${AWM_RETENTION_INTERVAL_SECONDS:-3600}
+    command: ["awm", "worker"]
+    volumes:
+      - awm-data:/data
+    depends_on:
+      awm:
+        condition: service_healthy
+
+volumes:
+  awm-data:
+    name: ${AWM_VOLUME_NAME:-agent-work-memory-data}
