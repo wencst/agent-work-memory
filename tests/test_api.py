@@ -1,76 +1,154 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import Literal
 
-from fastapi.testclient import TestClient
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from agent_work_memory.api import create_app
-from agent_work_memory.config import Settings
-from agent_work_memory.db import connect
-
-
-def make_settings(tmp_path: Path) -> Settings:
-    return Settings(api_key="x" * 32, database_path=tmp_path / "test.db")
+from .config import Settings
+from .db import connect, json_object, row_dict
 
 
-def auth() -> dict[str, str]:
-    return {"Authorization": f"Bearer {'x' * 32}"}
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def test_event_requires_key_and_is_idempotent(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
-    client = TestClient(create_app(settings))
-    payload = {
-        "source": "opencode", "session_id": "s1", "event_type": "tool.after",
-        "occurred_at": datetime.now(timezone.utc).isoformat(), "content": "Changed auth middleware",
-        "metadata": {}, "client_event_id": "event-1",
-    }
-    assert client.post("/v1/events", json=payload).status_code == 401
-    first = client.post("/v1/events", json=payload, headers=auth())
-    second = client.post("/v1/events", json=payload, headers=auth())
-    assert first.status_code == 201
-    assert second.json()["status"] == "duplicate"
-    assert second.json()["id"] == first.json()["id"]
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
 
 
-def test_only_approved_memories_are_searchable(tmp_path: Path) -> None:
-    settings = make_settings(tmp_path)
-    client = TestClient(create_app(settings))
-    event = client.post("/v1/events", headers=auth(), json={
-        "source": "test", "session_id": "s1", "event_type": "note",
-        "occurred_at": datetime.now(timezone.utc).isoformat(), "content": "We chose PostgreSQL for the event store.",
-    }).json()
+class EventIn(BaseModel):
+    source: str = Field(min_length=1, max_length=80)
+    session_id: str = Field(min_length=1, max_length=200)
+    event_type: str = Field(min_length=1, max_length=120)
+    occurred_at: datetime
+    content: str = Field(min_length=1, max_length=100_000)
+    metadata: dict = Field(default_factory=dict)
+    client_event_id: str | None = Field(default=None, max_length=200)
+
+
+class ReviewIn(BaseModel):
+    action: Literal["approve", "reject"]
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    app = FastAPI(title="Agent Work Memory", version="0.1.0", docs_url=None, redoc_url=None)
     conn = connect(settings.database_path)
-    conn.execute(
-        "INSERT INTO memories(id,event_id,kind,claim,evidence_quote,confidence,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        ("m1", event["id"], "decision", "We chose PostgreSQL for the event store.", "chose PostgreSQL", 0.9, "pending", datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
     conn.close()
-    query = {"q": "PostgreSQL"}
-    assert client.get("/v1/search", params=query, headers=auth()).json()["items"] == []
-    reviewed = client.post("/v1/memories/m1/review", headers=auth(), json={"action": "approve"})
-    assert reviewed.json()["status"] == "approved"
-    assert len(client.get("/v1/search", params=query, headers=auth()).json()["items"]) == 1
 
+    def resolve_scope(authorization: str | None) -> str:
+        supplied = authorization.removeprefix("Bearer ") if authorization else ""
+        if not supplied:
+            raise HTTPException(status_code=401, detail="Missing Bearer token")
+        if supplied == settings.admin_api_key:
+            return "admin"
+        if supplied in settings.agent_api_keys:
+            return "agent"
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-def test_retention_clears_raw_content_only(tmp_path: Path) -> None:
-    from datetime import timedelta
-    from agent_work_memory.cli import apply_retention
+    def require_scope(*allowed_scopes: str):
+        def dependency(authorization: str | None = Header(default=None)) -> str:
+            scope = resolve_scope(authorization)
+            if allowed_scopes and scope not in allowed_scopes:
+                raise HTTPException(status_code=403, detail="Token scope does not allow this operation")
+            return scope
 
-    settings = make_settings(tmp_path)
-    conn = connect(settings.database_path)
-    old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
-    conn.execute(
-        "INSERT INTO events(id,source,session_id,event_type,occurred_at,received_at,content) VALUES(?,?,?,?,?,?,?)",
-        ("e1", "test", "s1", "note", old, old, "raw secret text"),
-    )
-    conn.commit()
-    conn.close()
-    assert apply_retention(settings) == 1
-    conn = connect(settings.database_path)
-    row = conn.execute("SELECT content,expired_at FROM events WHERE id='e1'").fetchone()
-    conn.close()
-    assert row["content"] is None
-    assert row["expired_at"] is not None
+        return dependency
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok", "version": "0.1.0"}
+
+    @app.post("/v1/events", dependencies=[Depends(require_scope("agent", "admin"))], status_code=201)
+    def ingest_event(body: EventIn) -> dict:
+        event_id = str(uuid.uuid4())
+        received_at = utcnow()
+        conn = connect(settings.database_path)
+        try:
+            if body.client_event_id:
+                existing = conn.execute(
+                    "SELECT id FROM events WHERE source=? AND client_event_id=?", (body.source, body.client_event_id)
+                ).fetchone()
+                if existing:
+                    return {"id": existing["id"], "status": "duplicate"}
+            conn.execute(
+                "INSERT INTO events(id,client_event_id,source,session_id,event_type,occurred_at,received_at,content,metadata_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (event_id, body.client_event_id, body.source, body.session_id, body.event_type,
+                 iso(body.occurred_at), iso(received_at), body.content, json_object(body.metadata)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {"id": event_id, "status": "accepted", "received_at": iso(received_at)}
+
+    @app.get("/v1/events/{event_id}", dependencies=[Depends(require_scope("admin")]) )
+    def get_event(event_id: str) -> dict:
+        conn = connect(settings.database_path)
+        try:
+            row = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Event not found")
+            return row_dict(row)
+        finally:
+            conn.close()
+
+    @app.get("/v1/memories", dependencies=[Depends(require_scope("admin") )])
+    def list_memories(status: Literal["pending", "approved", "rejected"] | None = Query(default=None), limit: int = Query(default=50, ge=1, le=200)) -> dict:
+        conn = connect(settings.database_path)
+        try:
+            if status:
+                rows = conn.execute(
+                    "SELECT m.*, e.source, e.session_id, e.event_type, e.occurred_at, e.expired_at "
+                    "FROM memories m JOIN events e ON e.id=m.event_id WHERE m.status=? ORDER BY m.created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT m.*, e.source, e.session_id, e.event_type, e.occurred_at, e.expired_at "
+                    "FROM memories m JOIN events e ON e.id=m.event_id ORDER BY m.created_at DESC LIMIT ?", (limit,)
+                ).fetchall()
+            return {"items": [row_dict(r) for r in rows]}
+        finally:
+            conn.close()
+
+    @app.get("/v1/search", dependencies=[Depends(require_scope("agent", "admin") )])
+    def search_memories(q: str = Query(min_length=2, max_length=500), limit: int = Query(default=10, ge=1, le=50)) -> dict:
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conn = connect(settings.database_path)
+        try:
+            rows = conn.execute(
+                "SELECT m.*, e.source, e.session_id, e.event_type, e.occurred_at, e.expired_at "
+                "FROM memories m JOIN events e ON e.id=m.event_id "
+                "WHERE m.status='approved' AND m.claim LIKE ? ESCAPE '\\' ORDER BY m.created_at DESC LIMIT ?",
+                (f"%{escaped}%", limit),
+            ).fetchall()
+            return {"items": [row_dict(r) for r in rows]}
+        finally:
+            conn.close()
+
+    @app.post("/v1/memories/{memory_id}/review", dependencies=[Depends(require_scope("admin") )])
+    def review_memory(memory_id: str, body: ReviewIn) -> dict:
+        status = "approved" if body.action == "approve" else "rejected"
+        conn = connect(settings.database_path)
+        try:
+            cur = conn.execute(
+                "UPDATE memories SET status=?, reviewed_at=? WHERE id=? AND status='pending'",
+                (status, iso(utcnow()), memory_id),
+            )
+            conn.commit()
+            if cur.rowcount != 1:
+                exists = conn.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone()
+                if not exists:
+                    raise HTTPException(status_code=404, detail="Memory not found")
+                raise HTTPException(status_code=409, detail="Memory is no longer pending review")
+            return {"id": memory_id, "status": status}
+        finally:
+            conn.close()
+
+    return app

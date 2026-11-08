@@ -1,3 +1,9 @@
-"""Agent Work Memory MVP."""
+#!/usr/bin/env sh
+set -eu
 
-__version__ = "0.1.0"
+if [ ! -f .env ]; then
+  echo "Missing .env. Run ./scripts/compose-up.sh first or copy .env.example to .env." >&2
+  exit 1
+fi
+
+docker compose -f compose.yaml -f compose.local-llm.yaml up -d --build
